@@ -716,7 +716,6 @@ func (be *sqliteBackend) GetWorkflowMetadata(ctx context.Context, iid api.Instan
 		return nil, err
 	}
 
-
 	startEvent, err := be.getStartEvent(ctx, iid)
 	if err != nil {
 		return nil, err

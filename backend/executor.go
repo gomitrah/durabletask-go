@@ -36,6 +36,10 @@ const streamOutboxSize = 64
 type pendingWorkflow struct {
 	instanceID api.InstanceID
 	streamID   string
+	// completionToken is the tracked dispatch's WorkItem.CompletionToken; a
+	// drained buffered item is only requeued or cancelled when its token
+	// still matches, so a stale attempt cannot disturb a newer registration.
+	completionToken string
 }
 
 type pendingActivity struct {
@@ -57,7 +61,13 @@ type Executor interface {
 type grpcExecutor struct {
 	protos.UnimplementedTaskHubSidecarServiceServer
 
-	workItemQueue            chan *protos.WorkItem
+	workItemQueue chan *protos.WorkItem
+	// queueLock guards Shutdown's close of workItemQueue against the stream
+	// teardown drains that requeue buffered items onto it: a send racing the
+	// close would panic. Producers on the hot path do not take it; their
+	// lifecycle is ordered by the callers.
+	queueLock                sync.RWMutex
+	queueClosed              bool
 	pendingWorkflows         *sync.Map // map[api.InstanceID]*pendingWorkflow
 	pendingActivities        *sync.Map // map[string]*pendingActivity
 	streams                  *sync.Map // map[string]*streamState
@@ -211,7 +221,8 @@ func (g *grpcExecutor) executeWorkflowAsync(ctx context.Context, iid api.Instanc
 	// Capture the tracked value: a superseded attempt settling late must not
 	// delete a newer attempt's entry (both share the instance key), or the
 	// newer dispatch loses stream-disconnect/shutdown cancellation.
-	trackedWorkflow := &pendingWorkflow{instanceID: iid}
+	dispatchToken := uuid.NewString()
+	trackedWorkflow := &pendingWorkflow{instanceID: iid, completionToken: dispatchToken}
 	g.pendingWorkflows.Store(iid, trackedWorkflow)
 
 	req := &protos.WorkflowRequest{
@@ -228,7 +239,7 @@ func (g *grpcExecutor) executeWorkflowAsync(ctx context.Context, iid api.Instanc
 	// history and strand the instance (the chaos-campaign janitor-livelock
 	// class). Workers that do not echo tokens send an empty one and keep
 	// today's behavior.
-	token := uuid.NewString()
+	token := dispatchToken
 	workItem := &protos.WorkItem{
 		Request: &protos.WorkItem_WorkflowRequest{
 			WorkflowRequest: req,
@@ -425,8 +436,13 @@ func activityResponseEvent(e *protos.HistoryEvent, task *protos.TaskScheduledEve
 
 // Shutdown implements Executor
 func (g *grpcExecutor) Shutdown(ctx context.Context) error {
-	// closing the work item queue is a signal for shutdown
+	// closing the work item queue is a signal for shutdown; the lock fences
+	// stream-teardown drains, whose requeue onto a closed queue would panic
+	// (they fall back to cancelling the task once queueClosed is set).
+	g.queueLock.Lock()
+	g.queueClosed = true
 	close(g.workItemQueue)
+	g.queueLock.Unlock()
 
 	// Iterate through all pending items and close them to unblock the goroutines waiting on this
 	g.pendingActivities.Range(func(_, value any) bool {
@@ -454,7 +470,7 @@ func (g *grpcExecutor) Shutdown(ctx context.Context) error {
 }
 
 // Hello implements protos.TaskHubSidecarServiceServer
-func (grpcExecutor) Hello(ctx context.Context, empty *emptypb.Empty) (*emptypb.Empty, error) {
+func (*grpcExecutor) Hello(ctx context.Context, empty *emptypb.Empty) (*emptypb.Empty, error) {
 	return empty, nil
 }
 
@@ -471,6 +487,17 @@ func (g *grpcExecutor) GetWorkItems(req *protos.GetWorkItemsRequest, stream prot
 	// so the next turn for those instances falls back to a full history send.
 	ss := newStreamState(streamID, req)
 	g.streams.Store(streamID, ss)
+	// Registered before the registry delete so it runs after it (defers run
+	// LIFO): by drain time the stream is unroutable, and the drain's send
+	// lock waits out any producer that picked this owner before the removal,
+	// so a single drain empties the buffer for good. Registered before the
+	// connection callback below so a rejected connection also tears the
+	// published stream down through the same path. Without the drain, items
+	// routed into the affinity buffer but never pulled by the dispatch loop
+	// would die with the stream: they carry no streamID yet, so the pending
+	// cleanup below cannot cancel them, and the instance stalls with a
+	// registered completion waiter that nothing ever settles.
+	defer g.drainStreamBuffer(ss)
 	defer g.streams.Delete(streamID)
 
 	// There are some cases where the app may need to be notified when a client connects to fetch work items, like
@@ -504,10 +531,22 @@ func (g *grpcExecutor) GetWorkItems(req *protos.GetWorkItemsRequest, stream prot
 		g.pendingWorkflows.Range(func(key, value any) bool {
 			if p, ok := value.(*pendingWorkflow); ok && p.streamID == streamID {
 				g.logger.Debugf("cleaning up pending workflow: %s", key)
+				// Cancellation is keyed by instance (the Backend interface
+				// carries no attempt identity); upstream per-instance
+				// serialization bounds the replacement race, and a spurious
+				// cancel of a fresh attempt aborts into its recoverable
+				// retry.
 				err := g.backend.CancelWorkflowTask(context.Background(), p.instanceID)
 				if err != nil {
 					g.logger.Warnf("failed to cancel workflow task: %v", err)
+					// Keep the entry: the backend completion waiter is still
+					// live, and a later cleanup (executor shutdown) must be
+					// able to retry the cancellation.
+					return true
 				}
+				// Only this stream's entry: a newer attempt from a fresh
+				// stream may have re-stored the key since the Range yielded.
+				g.pendingWorkflows.CompareAndDelete(key, value)
 			}
 			return true
 		})

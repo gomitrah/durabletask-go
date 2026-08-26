@@ -391,3 +391,107 @@ func TestGetWorkItems_SendTimeoutCancelsPending(t *testing.T) {
 		[]api.InstanceID{"stuck-in-send", "buffered-1", "buffered-2"},
 		fb.canceledInstances())
 }
+
+// TestGetWorkItems_DisconnectRedeliversBufferedItem exercises the teardown
+// path through a real GetWorkItems disconnect: items parked in the dying
+// stream's affinity buffer (never pulled by its dispatch loop) must be
+// re-offered to the shared queue and delivered by a surviving stream. This
+// covers the defer ordering (registry delete before drain, drain before the
+// stream returns) that the direct drainStreamBuffer tests cannot.
+func TestGetWorkItems_DisconnectRedeliversBufferedItem(t *testing.T) {
+	fb := newFakeExecBackend()
+	exec, _ := NewGrpcExecutor(fb, defaultLogger)
+	g, ok := exec.(*grpcExecutor)
+	require.True(t, ok)
+
+	// Survivor stream: plain (non-stateful) so it never becomes the affinity
+	// owner; it only consumes the shared queue.
+	var recMu sync.Mutex
+	survivorGot := map[string]bool{}
+	survivorCtx, survivorCancel := context.WithCancel(t.Context())
+	defer survivorCancel()
+	survivor := &fakeWorkItemsStream{
+		ctx: survivorCtx,
+		send: func(wi *protos.WorkItem) error {
+			recMu.Lock()
+			survivorGot[wi.GetWorkflowRequest().GetInstanceId()] = true
+			recMu.Unlock()
+			return nil
+		},
+	}
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		assert.NoError(t, g.GetWorkItems(&protos.GetWorkItemsRequest{}, survivor))
+	}()
+
+	// Dying stream: stateful-history capable, its Send blocks forever so the
+	// dispatch loop backs up and items park in the affinity buffer.
+	dyingCtx, dyingCancel := context.WithCancel(t.Context())
+	defer dyingCancel()
+	blockSend := make(chan struct{})
+	defer close(blockSend)
+	dying := &fakeWorkItemsStream{
+		ctx: dyingCtx,
+		send: func(wi *protos.WorkItem) error {
+			select {
+			case <-blockSend:
+			case <-dyingCtx.Done():
+			}
+			return dyingCtx.Err()
+		},
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		// The dying stream may return the failed send's error; teardown
+		// behavior is what this test asserts, not the return value.
+		_ = g.GetWorkItems(statefulWorkItemsRequest(), dying)
+	}()
+
+	// Wait for the dying stream to register, then locate its streamState.
+	var ss *streamState
+	require.Eventually(t, func() bool {
+		g.streams.Range(func(_, value any) bool {
+			if s, sok := value.(*streamState); sok && s.statefulHistory {
+				ss = s
+			}
+			return true
+		})
+		return ss != nil
+	}, time.Second*5, time.Millisecond)
+
+	// Route items into the affinity buffer until at least one is parked
+	// there (the dispatch loop drains into its outbox until the blocked
+	// writer backs it up; over-filling by the outbox size guarantees a
+	// residue in ss.ch).
+	i := 0
+	require.Eventually(t, func() bool {
+		if len(ss.ch) > 0 && i > streamOutboxSize {
+			return true
+		}
+		i++
+		iid := fmt.Sprintf("parked-%d", i)
+		g.pendingWorkflows.Store(api.InstanceID(iid), &pendingWorkflow{instanceID: api.InstanceID(iid)})
+		ok := ss.trySend(&protos.WorkItem{Request: &protos.WorkItem_WorkflowRequest{
+			WorkflowRequest: &protos.WorkflowRequest{InstanceId: iid},
+		}})
+		_ = ok
+		return false
+	}, time.Second*5, time.Millisecond)
+
+	// Disconnect the dying stream: the parked residue must reach the
+	// survivor via the shared queue.
+	dyingCancel()
+
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		recMu.Lock()
+		defer recMu.Unlock()
+		assert.NotEmpty(c, survivorGot, "a surviving stream must receive the items parked in the dead stream's buffer")
+	}, time.Second*10, time.Millisecond*5)
+
+	assert.Empty(t, ss.ch, "the dead stream's buffer must be fully drained")
+	survivorCancel()
+	wg.Wait()
+}

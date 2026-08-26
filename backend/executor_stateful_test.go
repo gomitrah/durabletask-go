@@ -14,9 +14,12 @@ limitations under the License.
 package backend
 
 import (
+	"context"
+	"errors"
 	"strconv"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -233,4 +236,278 @@ func TestAffinityStreamOwner_MinimalRemapOnMembershipChange(t *testing.T) {
 			assert.Equal(t, prev, got, "instance %s must not remap when its owner stayed connected", iid)
 		}
 	}
+}
+
+func TestAffinityStreamOwner_SkipsClosedStreams(t *testing.T) {
+	closing := capableStream("closing")
+	survivor := capableStream("survivor")
+	g := streamsWith(closing, survivor)
+
+	closing.closed.Store(true)
+	for i := 0; i < 50; i++ {
+		owner := g.affinityStreamOwner(api.InstanceID("inst-" + strconv.Itoa(i)))
+		require.NotNil(t, owner)
+		assert.Equal(t, "survivor", owner.id,
+			"a stream that has begun tearing down must not be chosen as owner")
+	}
+}
+
+func wfWorkItem(iid string) *protos.WorkItem {
+	return &protos.WorkItem{Request: &protos.WorkItem_WorkflowRequest{
+		WorkflowRequest: workflowReq(iid, 0, 1),
+	}}
+}
+
+// trackWorkflow registers a pending entry matching wfWorkItem's (empty)
+// completion token, so the drain treats the item as the live dispatch.
+func trackWorkflow(g *grpcExecutor, iid string) {
+	g.pendingWorkflows.Store(api.InstanceID(iid), &pendingWorkflow{instanceID: api.InstanceID(iid)})
+}
+
+// A dying stream's affinity buffer must be re-offered to the shared queue so
+// a surviving worker delivers the items, instead of orphaning them with the
+// stream (which stalled the instance until an external recovery kicked in).
+func TestDrainStreamBuffer_RequeuesToSharedQueue(t *testing.T) {
+	g := &grpcExecutor{
+		workItemQueue:    make(chan *protos.WorkItem, 8),
+		pendingWorkflows: &sync.Map{},
+		streams:          &sync.Map{},
+		logger:           DefaultLogger(),
+	}
+	trackWorkflow(g, "wf-a")
+	trackWorkflow(g, "wf-b")
+	ss := capableStream("dying")
+	ss.closed.Store(true)
+	ss.ch <- wfWorkItem("wf-a")
+	ss.ch <- wfWorkItem("wf-b")
+
+	g.drainStreamBuffer(ss)
+
+	require.Len(t, g.workItemQueue, 2)
+	got := map[string]struct{}{}
+	for i := 0; i < 2; i++ {
+		wi := <-g.workItemQueue
+		got[wi.GetWorkflowRequest().GetInstanceId()] = struct{}{}
+	}
+	assert.Contains(t, got, "wf-a")
+	assert.Contains(t, got, "wf-b")
+	assert.Empty(t, ss.ch, "the dying stream's buffer must be fully drained")
+}
+
+type fakeCancelBackend struct {
+	Backend
+	mu        sync.Mutex
+	cancelled []api.InstanceID
+}
+
+func (f *fakeCancelBackend) CancelWorkflowTask(_ context.Context, iid api.InstanceID) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.cancelled = append(f.cancelled, iid)
+	return nil
+}
+
+// When the shared queue has no capacity to absorb a drained item, the turn is
+// aborted so the backend's retry path re-derives it: degraded, but never lost.
+func TestDrainStreamBuffer_CancelsWhenQueueFull(t *testing.T) {
+	fb := &fakeCancelBackend{}
+	g := &grpcExecutor{
+		workItemQueue:    make(chan *protos.WorkItem),
+		pendingWorkflows: &sync.Map{},
+		streams:          &sync.Map{},
+		backend:          fb,
+		logger:           DefaultLogger(),
+	}
+	trackWorkflow(g, "wf-orphan")
+	ss := capableStream("dying")
+	ss.closed.Store(true)
+	ss.ch <- wfWorkItem("wf-orphan")
+
+	g.drainStreamBuffer(ss)
+
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	require.Len(t, fb.cancelled, 1)
+	assert.Equal(t, api.InstanceID("wf-orphan"), fb.cancelled[0])
+}
+
+// A producer must not route into a closed owner's buffer: with the owner
+// closed the item takes the shared queue, where any surviving stream can
+// deliver it.
+func TestDispatchWorkflowWorkItem_ClosedOwnerFallsToSharedQueue(t *testing.T) {
+	owner := capableStream("owner")
+	g := streamsWith(owner)
+	g.workItemQueue = make(chan *protos.WorkItem, 1)
+	g.logger = DefaultLogger()
+
+	// Fill the owner's buffer so the fast path cannot accept, then close it:
+	// the post-grace re-check must divert to the shared queue rather than
+	// blocking on the dead owner.
+	for i := 0; i < cap(owner.ch); i++ {
+		owner.ch <- wfWorkItem("filler")
+	}
+	owner.closed.Store(true)
+
+	wi := wfWorkItem("wf-live")
+	require.NoError(t, g.dispatchWorkflowWorkItem(context.Background(), "wf-live", wi))
+	require.Len(t, g.workItemQueue, 1)
+	assert.Equal(t, "wf-live", (<-g.workItemQueue).GetWorkflowRequest().GetInstanceId())
+}
+
+// After Shutdown closed the shared queue, a stream teardown drain must not
+// panic on the send; it cancels the task so the backend's retry redelivers.
+func TestDrainStreamBuffer_ShutdownCancelsInsteadOfPanicking(t *testing.T) {
+	fb := &fakeCancelBackend{}
+	g := &grpcExecutor{
+		workItemQueue:    make(chan *protos.WorkItem, 8),
+		pendingWorkflows: &sync.Map{},
+		streams:          &sync.Map{},
+		backend:          fb,
+		logger:           DefaultLogger(),
+	}
+	g.queueLock.Lock()
+	g.queueClosed = true
+	close(g.workItemQueue)
+	g.queueLock.Unlock()
+
+	trackWorkflow(g, "wf-shutdown")
+	ss := capableStream("dying")
+	ss.ch <- wfWorkItem("wf-shutdown")
+
+	require.NotPanics(t, func() { g.drainStreamBuffer(ss) })
+
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	require.Len(t, fb.cancelled, 1)
+	assert.Equal(t, api.InstanceID("wf-shutdown"), fb.cancelled[0])
+}
+
+// A producer that selected an owner just before teardown must serialize with
+// the drain: its item either lands before the drain (re-offered) or diverts
+// to the shared queue, never into the dead buffer afterwards.
+func TestTrySend_ClosedStreamRefuses(t *testing.T) {
+	ss := capableStream("s")
+	require.True(t, ss.trySend(wfWorkItem("a")))
+	g := &grpcExecutor{workItemQueue: make(chan *protos.WorkItem, 8), pendingWorkflows: &sync.Map{}, streams: &sync.Map{}, logger: DefaultLogger()}
+	trackWorkflow(g, "a")
+	g.drainStreamBuffer(ss)
+	assert.False(t, ss.trySend(wfWorkItem("b")), "a drained stream must refuse new sends")
+	ok, err := ss.trySendGrace(context.Background(), wfWorkItem("c"), time.Millisecond)
+	require.NoError(t, err)
+	assert.False(t, ok)
+	assert.Empty(t, ss.ch, "nothing may land in the buffer after the drain")
+}
+
+type flakyCancelBackend struct {
+	Backend
+	mu        sync.Mutex
+	failures  int
+	cancelled []api.InstanceID
+}
+
+func (f *flakyCancelBackend) CancelWorkflowTask(_ context.Context, iid api.InstanceID) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failures > 0 {
+		f.failures--
+		return errors.New("transient backend error")
+	}
+	f.cancelled = append(f.cancelled, iid)
+	return nil
+}
+
+// A transient cancel error during the drain fallback must not discard the
+// item: the completion waiter is live, so the drain retries until the item
+// is settled one way or the other.
+func TestRequeueWorkItem_RetriesTransientCancelFailure(t *testing.T) {
+	fb := &flakyCancelBackend{failures: 3}
+	g := &grpcExecutor{
+		workItemQueue:    make(chan *protos.WorkItem),
+		pendingWorkflows: &sync.Map{},
+		streams:          &sync.Map{},
+		backend:          fb,
+		logger:           DefaultLogger(),
+	}
+	trackWorkflow(g, "wf-flaky")
+	ss := capableStream("dying")
+	ss.ch <- wfWorkItem("wf-flaky")
+
+	g.drainStreamBuffer(ss)
+
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	require.Len(t, fb.cancelled, 1, "the item must be settled once the transient error clears")
+	assert.Equal(t, api.InstanceID("wf-flaky"), fb.cancelled[0])
+	assert.Zero(t, fb.failures)
+}
+
+// A drained item whose dispatch was superseded (completion token no longer
+// matches the tracked entry) or already settled (no entry) must be dropped,
+// never requeued or cancelled against the live registration.
+func TestRequeueWorkItem_DropsSupersededOrSettled(t *testing.T) {
+	fb := &fakeCancelBackend{}
+	g := &grpcExecutor{
+		workItemQueue:    make(chan *protos.WorkItem, 8),
+		pendingWorkflows: &sync.Map{},
+		streams:          &sync.Map{},
+		backend:          fb,
+		logger:           DefaultLogger(),
+	}
+
+	// Superseded: a newer dispatch owns the entry with a different token.
+	g.pendingWorkflows.Store(api.InstanceID("wf-old"), &pendingWorkflow{
+		instanceID:      "wf-old",
+		completionToken: "newer-dispatch",
+	})
+	g.requeueWorkItem(wfWorkItem("wf-old"))
+
+	// Settled: no entry at all.
+	g.requeueWorkItem(wfWorkItem("wf-gone"))
+
+	assert.Empty(t, g.workItemQueue, "stale items must not be requeued")
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	assert.Empty(t, fb.cancelled, "stale items must not cancel the live registration")
+}
+
+type unknownInstanceBackend struct {
+	Backend
+	mu    sync.Mutex
+	calls int
+}
+
+func (f *unknownInstanceBackend) CancelWorkflowTask(_ context.Context, iid api.InstanceID) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+	return &api.UnknownInstanceIDError{InstanceID: string(iid)}
+}
+
+// An unknown-registration error from the cancel fallback is permanent (the
+// attempt settled concurrently): the drain must treat it as settled, not
+// retry forever.
+func TestRequeueWorkItem_UnknownInstanceIsSettled(t *testing.T) {
+	fb := &unknownInstanceBackend{}
+	g := &grpcExecutor{
+		workItemQueue:    make(chan *protos.WorkItem),
+		pendingWorkflows: &sync.Map{},
+		streams:          &sync.Map{},
+		backend:          fb,
+		logger:           DefaultLogger(),
+	}
+	trackWorkflow(g, "wf-unknown")
+
+	done := make(chan struct{})
+	go func() {
+		g.requeueWorkItem(wfWorkItem("wf-unknown"))
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("requeueWorkItem must return once the registration is unknown, not retry forever")
+	}
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	assert.Equal(t, 1, fb.calls)
 }

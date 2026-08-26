@@ -87,7 +87,7 @@ func testEvents() []*protos.HistoryEvent {
 			Timestamp: timestamppb.New(time.Date(2026, 3, 18, 12, 0, 1, 0, time.UTC)),
 			EventType: &protos.HistoryEvent_ExecutionStarted{
 				ExecutionStarted: &protos.ExecutionStartedEvent{
-					Name: "TestWorkflow",
+					Name:  "TestWorkflow",
 					Input: wrapperspb.String(`{"key":"value"}`),
 					WorkflowInstance: &protos.WorkflowInstance{
 						InstanceId:  "test-instance-1",
@@ -914,9 +914,9 @@ func TestVerifyChainWithTrustAnchors(t *testing.T) {
 	// Verify with the correct CA as trust anchor — should pass.
 	_, err = VerifyChain(VerifyChainOptions{
 		RawSignatures: rawSigs,
-		Certs:        certs,
-		AllRawEvents: raw,
-		Signer:       tc,
+		Certs:         certs,
+		AllRawEvents:  raw,
+		Signer:        tc,
 	})
 	require.NoError(t, err)
 }
@@ -948,9 +948,9 @@ func TestVerifyChainWithWrongTrustAnchor(t *testing.T) {
 	tcVerify := newTestSigner(t, chainDER, leafPriv, wrongCA)
 	_, err = VerifyChain(VerifyChainOptions{
 		RawSignatures: rawSigs,
-		Certs:        certs,
-		AllRawEvents: raw,
-		Signer:       tcVerify,
+		Certs:         certs,
+		AllRawEvents:  raw,
+		Signer:        tcVerify,
 	})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "chain-of-trust verification failed for certificate index 0")
@@ -1026,9 +1026,9 @@ func TestVerifyChainWithIntermediateAndTrustAnchor(t *testing.T) {
 	// Verify with root as trust anchor — should pass via intermediate chain.
 	_, err = VerifyChain(VerifyChainOptions{
 		RawSignatures: rawSigs,
-		Certs:        certs,
-		AllRawEvents: raw,
-		Signer:       tc,
+		Certs:         certs,
+		AllRawEvents:  raw,
+		Signer:        tc,
 	})
 	require.NoError(t, err)
 }
@@ -1088,11 +1088,11 @@ func TestVerifyChainCertTrustCacheWindow(t *testing.T) {
 	tc := newTestSigner(t, certDER, priv, cert)
 
 	timestamps := []time.Time{
-		time.Date(2026, 1, 15, 0, 0, 0, 0, time.UTC),  // T1: Jan
-		time.Date(2026, 3, 15, 0, 0, 0, 0, time.UTC),  // T2: Mar (extends max)
-		time.Date(2026, 2, 15, 0, 0, 0, 0, time.UTC),  // T3: Feb (within [T1,T2], cached)
-		time.Date(2026, 4, 15, 0, 0, 0, 0, time.UTC),  // T4: Apr (beyond max, re-verify)
-		time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC),   // T5: Mar (within [T1,T4], cached)
+		time.Date(2026, 1, 15, 0, 0, 0, 0, time.UTC), // T1: Jan
+		time.Date(2026, 3, 15, 0, 0, 0, 0, time.UTC), // T2: Mar (extends max)
+		time.Date(2026, 2, 15, 0, 0, 0, 0, time.UTC), // T3: Feb (within [T1,T2], cached)
+		time.Date(2026, 4, 15, 0, 0, 0, 0, time.UTC), // T4: Apr (beyond max, re-verify)
+		time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC),  // T5: Mar (within [T1,T4], cached)
 	}
 
 	// Create one event per signature, each with a different timestamp.
@@ -1132,9 +1132,9 @@ func TestVerifyChainCertTrustCacheWindow(t *testing.T) {
 	// Full chain verification should succeed.
 	_, err := VerifyChain(VerifyChainOptions{
 		RawSignatures: rawSigs,
-		Certs:        certs,
-		AllRawEvents: raw,
-		Signer:       tc,
+		Certs:         certs,
+		AllRawEvents:  raw,
+		Signer:        tc,
 	})
 	require.NoError(t, err)
 }
@@ -1190,9 +1190,9 @@ func TestVerifyChainCertTrustCacheWindowExpiredBefore(t *testing.T) {
 	// Should fail — the second event's timestamp is before the cert's NotBefore.
 	_, err = VerifyChain(VerifyChainOptions{
 		RawSignatures: rawSigs,
-		Certs:        certs,
-		AllRawEvents: raw,
-		Signer:       tc,
+		Certs:         certs,
+		AllRawEvents:  raw,
+		Signer:        tc,
 	})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "certificate not valid at event time")
