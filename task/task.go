@@ -17,6 +17,12 @@ var ErrTaskBlocked = errors.New("the current task is blocked")
 // when configured timeouts expire.
 var ErrTaskCanceled = errors.New("the task was canceled") // CONSIDER: More specific info about the task
 
+// ErrTaskNotSelectable is returned by [WorkflowContext.Select] when one of the given tasks doesn't
+// support the completion-callback hook Select relies on to detect a winner without calling Await
+// (for example, a task returned by a retried CallActivity/CallChildWorkflow, whose completion state
+// is only ever discovered as a side effect of calling Await).
+var ErrTaskNotSelectable = errors.New("task does not support Select")
+
 // Task is an interface for asynchronous durable tasks. A task is conceptually similar to a future.
 type Task interface {
 	Await(v any) error
@@ -24,13 +30,13 @@ type Task interface {
 }
 
 type completableTask struct {
-	workflowCtx       *WorkflowContext
-	isCompleted       bool
-	isCanceled        bool
-	rawResult         []byte
-	failureDetails    *protos.TaskFailureDetails
-	completedCallback func()
-	taskExecutionId   string
+	workflowCtx        *WorkflowContext
+	isCompleted        bool
+	isCanceled         bool
+	rawResult          []byte
+	failureDetails     *protos.TaskFailureDetails
+	completedCallbacks []func()
+	taskExecutionId    string
 	// kind is the resolution correlator family this task belongs to when it
 	// is registered in pendingTasks (task, timer or child). A resolution
 	// event only completes a pending entry of its own kind; anything else is
@@ -88,6 +94,9 @@ func (t *completableTask) TaskExecutionId() string {
 	return t.taskExecutionId
 }
 
+// onCompleted registers [callback] to run when the task completes. Multiple callbacks may be
+// registered on the same task (e.g. by both WaitForSingleEvent's internal timer plumbing and
+// Select), and all of them run, in registration order, when the task completes.
 func (t *completableTask) onCompleted(callback func()) {
 	// A task can already be completed at registration time when a buffered
 	// early resolution was delivered as the task was scheduled; fire the
@@ -96,7 +105,7 @@ func (t *completableTask) onCompleted(callback func()) {
 		callback()
 		return
 	}
-	t.completedCallback = callback
+	t.completedCallbacks = append(t.completedCallbacks, callback)
 }
 
 func (t *completableTask) complete(rawResult []byte) {
@@ -116,8 +125,10 @@ func (t *completableTask) cancel() {
 
 func (t *completableTask) completeInternal() {
 	t.isCompleted = true
-	if t.completedCallback != nil {
-		t.completedCallback()
+	callbacks := t.completedCallbacks
+	t.completedCallbacks = nil
+	for _, callback := range callbacks {
+		callback()
 	}
 }
 

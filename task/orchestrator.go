@@ -2,6 +2,7 @@ package task
 
 import (
 	"container/list"
+	"errors"
 	"fmt"
 	"math"
 	"reflect"
@@ -718,6 +719,80 @@ func (ctx *WorkflowContext) WaitForSingleEvent(eventName string, timeout time.Du
 		})
 	}
 	return task
+}
+
+// Select blocks until the first of the given [tasks] completes and returns its index. Once Select
+// returns, callers should call Await on the task at the returned index to obtain its result or
+// error; the remaining tasks are left pending and may still be selected or awaited later (for
+// example, in a loop that repeatedly selects over the tasks that have not yet completed).
+//
+// A task that was already completed before Select was called is treated as an immediate winner. If
+// more than one of the given tasks is already completed at the time of the call, the one with the
+// lowest index wins.
+//
+// Select requires at least one task and returns an error if no tasks are given. Every task passed to
+// Select must have been obtained from this same WorkflowContext (e.g. via CallActivity, CreateTimer,
+// or WaitForSingleEvent); tasks whose completion cannot be observed without calling Await -- such as
+// a task returned by CallActivity/CallChildWorkflow configured with a retry policy -- are not
+// supported and cause Select to return ErrTaskNotSelectable.
+//
+// Like Await, Select may panic with ErrTaskBlocked as the panic value when none of the tasks have
+// completed and there is no further history to process. This is normal control flow for workflow
+// functions, which must never recover from such panics.
+func (ctx *WorkflowContext) Select(tasks ...Task) (int, error) {
+	if len(tasks) == 0 {
+		return -1, errors.New("Select requires at least one task")
+	}
+
+	completable := make([]*completableTask, len(tasks))
+	for i, t := range tasks {
+		ct, ok := underlyingCompletableTask(t)
+		if !ok {
+			return -1, fmt.Errorf("%w: task at index %d", ErrTaskNotSelectable, i)
+		}
+		completable[i] = ct
+	}
+
+	winner := -1
+	for i, ct := range completable {
+		ct.onCompleted(func() {
+			if winner == -1 {
+				winner = i
+			}
+		})
+		if winner != -1 {
+			// A task that was already completed at registration time invokes its
+			// callback synchronously above; no need to look at the rest just to
+			// find the lowest-index winner, since ties can only happen among
+			// already-completed tasks and those are visited in index order.
+			break
+		}
+	}
+
+	for winner == -1 {
+		ok, err := ctx.processNextEvent()
+		if err != nil {
+			return -1, err
+		}
+		if !ok {
+			break
+		}
+	}
+
+	if winner != -1 {
+		return winner, nil
+	}
+
+	panic(ErrTaskBlocked)
+}
+
+// underlyingCompletableTask unwraps [t] to the concrete *completableTask backing it, if any. Retry
+// wrapped tasks (taskWrapper) are deliberately not unwrapped: their real completion, including any
+// retry attempts, only happens as a side effect of calling Await on them, so their delegate's
+// completion state does not reflect whether the wrapped task, as a whole, is done.
+func underlyingCompletableTask(t Task) (*completableTask, bool) {
+	ct, ok := t.(*completableTask)
+	return ct, ok
 }
 
 func (ctx *WorkflowContext) ContinueAsNew(newInput any, options ...ContinueAsNewOption) {
