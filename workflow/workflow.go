@@ -96,6 +96,28 @@ func (w *WorkflowContext) WaitForExternalEvent(eventName string, timeout time.Du
 	return w.oc.WaitForSingleEvent(eventName, timeout)
 }
 
+// Select blocks until the first of the given [tasks] completes and returns its index. Once Select
+// returns, callers should call Await on the task at the returned index to obtain its result or
+// error; the remaining tasks are left pending and may still be selected or awaited later (for
+// example, in a loop that repeatedly selects over the tasks that have not yet completed).
+//
+// A task that was already completed before Select was called is treated as an immediate winner. If
+// more than one of the given tasks is already completed at the time of the call, the one with the
+// lowest index wins.
+//
+// Select requires at least one task and returns an error if no tasks are given. Every task passed to
+// Select must have been obtained from this same WorkflowContext (e.g. via CallActivity, CreateTimer,
+// or WaitForExternalEvent); tasks whose completion cannot be observed without calling Await -- such
+// as a task returned by CallActivity/CallChildWorkflow configured with a retry policy -- are not
+// supported and cause Select to return [task.ErrTaskNotSelectable].
+func (w *WorkflowContext) Select(tasks ...Task) (int, error) {
+	otasks := make([]task.Task, len(tasks))
+	for i, t := range tasks {
+		otasks[i] = t
+	}
+	return w.oc.Select(otasks...)
+}
+
 func (w *WorkflowContext) ContinueAsNew(newInput any, options ...ContinueAsNewOption) {
 	oopts := make([]task.ContinueAsNewOption, len(options))
 	for i, o := range options {
