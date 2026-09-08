@@ -700,6 +700,47 @@ func Test_CompletableTask_OnCompletedAfterCompletion(t *testing.T) {
 	assert.True(t, fired, "onCompleted on an already completed task must fire immediately")
 }
 
+// Test_CompletableTask_OnCompletedUnregister verifies that calling the unregister function
+// returned by onCompleted removes the callback before the task completes, and that unregistering
+// is safe to call again afterwards (a no-op) and safe even after the task has since completed.
+func Test_CompletableTask_OnCompletedUnregister(t *testing.T) {
+	task := newTask(newTestContext(t))
+
+	fired := false
+	unregister := task.onCompleted(func() { fired = true })
+	require.Len(t, task.completedCallbacks, 1)
+
+	unregister()
+	task.complete([]byte("x"))
+	assert.False(t, fired, "unregistered callback must not fire on completion")
+
+	// Calling it again, and calling it after completion, must not panic.
+	unregister()
+}
+
+// Test_Select_DoesNotLeakCallbacksOnLosingTasks is a regression test for a callback leak: Select
+// used to register a completion callback on every candidate task but only ever remove it when the
+// task itself completed, so a task that lost the same Select call repeatedly (e.g. selected in a
+// loop against a set of tasks that mostly haven't completed yet) accumulated one dead callback per
+// call. Select must unregister its callback from every losing task before returning.
+func Test_Select_DoesNotLeakCallbacksOnLosingTasks(t *testing.T) {
+	ctx := newTestContext(t)
+
+	done := newTask(ctx)
+	done.complete([]byte(`null`))
+
+	pending := newTask(ctx)
+
+	const iterations = 5
+	for i := 0; i < iterations; i++ {
+		winner, err := ctx.Select(pending, done)
+		require.NoError(t, err)
+		require.Equal(t, 1, winner)
+		require.Empty(t, pending.completedCallbacks,
+			"Select must not leave a dead callback behind on a task that didn't win")
+	}
+}
+
 // Benchmark_ReplaySequentialActivities measures a full replay of a workflow
 // with 50 sequential completed activities, the shape dominated by the
 // per-event and per-schedule bookkeeping this file's feature adds to.

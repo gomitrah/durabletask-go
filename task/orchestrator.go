@@ -748,18 +748,19 @@ func (ctx *WorkflowContext) Select(tasks ...Task) (int, error) {
 	for i, t := range tasks {
 		ct, ok := underlyingCompletableTask(t)
 		if !ok {
-			return -1, fmt.Errorf("%w: task at index %d", ErrTaskNotSelectable, i)
+			return -1, fmt.Errorf("task at index %d: %w", i, ErrTaskNotSelectable)
 		}
 		completable[i] = ct
 	}
 
 	winner := -1
+	unregister := make([]func(), 0, len(completable))
 	for i, ct := range completable {
-		ct.onCompleted(func() {
+		unregister = append(unregister, ct.onCompleted(func() {
 			if winner == -1 {
 				winner = i
 			}
-		})
+		}))
 		if winner != -1 {
 			// A task that was already completed at registration time invokes its
 			// callback synchronously above; no need to look at the rest just to
@@ -768,6 +769,15 @@ func (ctx *WorkflowContext) Select(tasks ...Task) (int, error) {
 			break
 		}
 	}
+
+	// Whichever task wins (or if none do because there's no more history to process), every
+	// registration made above must be undone so a losing task doesn't carry a dead callback
+	// into a future Select or WaitForSingleEvent call on it.
+	defer func() {
+		for _, u := range unregister {
+			u()
+		}
+	}()
 
 	for winner == -1 {
 		ok, err := ctx.processNextEvent()

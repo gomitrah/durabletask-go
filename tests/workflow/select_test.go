@@ -16,6 +16,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
+	"github.com/dapr/durabletask-go/api/protos"
 	"github.com/dapr/durabletask-go/backend"
 	"github.com/dapr/durabletask-go/backend/sqlite"
 	"github.com/dapr/durabletask-go/workflow"
@@ -133,5 +134,6 @@ func Test_Workflow_Select_ExternalEventRace(t *testing.T) {
 	defer cancelTimeout()
 	metadata, err := workflowClient.WaitForWorkflowCompletion(timeoutCtx, id)
 	require.NoError(t, err)
+	require.Equal(t, protos.OrchestrationStatus_ORCHESTRATION_STATUS_COMPLETED, metadata.RuntimeStatus)
 	assert.Equal(t, `"Reject:nope"`, metadata.Output.Value)
 }

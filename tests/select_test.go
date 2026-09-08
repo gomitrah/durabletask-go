@@ -223,4 +223,3 @@ func Test_Select_RetryWrappedTaskRejected(t *testing.T) {
 	require.Equal(t, protos.OrchestrationStatus_ORCHESTRATION_STATUS_COMPLETED, metadata.RuntimeStatus)
 	assert.Contains(t, metadata.Output.Value, "task does not support Select")
 }
-

@@ -3,6 +3,7 @@ package task
 import (
 	"errors"
 	"fmt"
+	"sort"
 
 	"github.com/dapr/durabletask-go/api/protos"
 	"github.com/dapr/durabletask-go/backend/runtimestate/dedup"
@@ -30,12 +31,16 @@ type Task interface {
 }
 
 type completableTask struct {
-	workflowCtx        *WorkflowContext
-	isCompleted        bool
-	isCanceled         bool
-	rawResult          []byte
-	failureDetails     *protos.TaskFailureDetails
-	completedCallbacks []func()
+	workflowCtx    *WorkflowContext
+	isCompleted    bool
+	isCanceled     bool
+	rawResult      []byte
+	failureDetails *protos.TaskFailureDetails
+	// completedCallbacks holds the callbacks registered via onCompleted, keyed by an id from
+	// nextCallbackID so a specific registration can be removed (see the unregister function
+	// onCompleted returns) without disturbing any other registration.
+	completedCallbacks map[int64]func()
+	nextCallbackID     int64
 	taskExecutionId    string
 	// kind is the resolution correlator family this task belongs to when it
 	// is registered in pendingTasks (task, timer or child). A resolution
@@ -94,18 +99,34 @@ func (t *completableTask) TaskExecutionId() string {
 	return t.taskExecutionId
 }
 
-// onCompleted registers [callback] to run when the task completes. Multiple callbacks may be
-// registered on the same task (e.g. by both WaitForSingleEvent's internal timer plumbing and
-// Select), and all of them run, in registration order, when the task completes.
-func (t *completableTask) onCompleted(callback func()) {
+// onCompleted registers [callback] to run when the task completes, and returns a function that
+// unregisters it. Multiple callbacks may be registered on the same task (e.g. by both
+// WaitForSingleEvent's internal timer plumbing and Select), and all of them run, in registration
+// order, when the task completes.
+//
+// Callers that register a callback but then lose interest before the task completes (for example,
+// Select registering on every candidate task but only caring about the one that actually won) must
+// call the returned unregister function, or the callback is retained on the task indefinitely.
+// Unregistering after the task has already completed, or more than once, is a no-op, and is safe to
+// do regardless of what other callbacks have since been registered or unregistered on the task.
+func (t *completableTask) onCompleted(callback func()) (unregister func()) {
 	// A task can already be completed at registration time when a buffered
 	// early resolution was delivered as the task was scheduled; fire the
-	// callback immediately so completion side effects are not lost.
+	// callback immediately so completion side effects are not lost. There is
+	// nothing to unregister in this case since the callback was never stored.
 	if t.isCompleted {
 		callback()
-		return
+		return func() {}
 	}
-	t.completedCallbacks = append(t.completedCallbacks, callback)
+	id := t.nextCallbackID
+	t.nextCallbackID++
+	if t.completedCallbacks == nil {
+		t.completedCallbacks = make(map[int64]func())
+	}
+	t.completedCallbacks[id] = callback
+	return func() {
+		delete(t.completedCallbacks, id)
+	}
 }
 
 func (t *completableTask) complete(rawResult []byte) {
@@ -127,8 +148,18 @@ func (t *completableTask) completeInternal() {
 	t.isCompleted = true
 	callbacks := t.completedCallbacks
 	t.completedCallbacks = nil
-	for _, callback := range callbacks {
-		callback()
+	if len(callbacks) == 0 {
+		return
+	}
+	// Callback ids are assigned in registration order (see onCompleted), so sorting by id runs
+	// them in the same deterministic order regardless of map iteration order.
+	ids := make([]int64, 0, len(callbacks))
+	for id := range callbacks {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	for _, id := range ids {
+		callbacks[id]()
 	}
 }
 
