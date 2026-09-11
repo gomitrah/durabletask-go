@@ -237,3 +237,85 @@ func Test_Select_RetryWrappedTaskWins(t *testing.T) {
 	assert.Equal(t, `"eventually succeeded"`, metadata.Output.Value)
 	assert.Equal(t, int32(2), atomic.LoadInt32(&attempts))
 }
+
+// Test_Select_ActivityRacesTimer covers the most common WhenAny shape: a plain (non-retry)
+// CallActivity racing a CreateTimer. The activity's 1s sleep is deliberately much longer than the
+// timer's 50ms delay so the timer wins with a wide margin, comfortably covering the extra latency
+// the sqlite backend's polling (with its own exponential backoff) adds on top of the timer's raw
+// delay before the workflow actually picks the TimerFired event up.
+func Test_Select_ActivityRacesTimer(t *testing.T) {
+	r := task.NewTaskRegistry()
+	r.AddWorkflowN("SelectActivityRacesTimerWorkflow", func(ctx *task.WorkflowContext) (any, error) {
+		slowActivity := ctx.CallActivity("SlowActivity")
+		timer := ctx.CreateTimer(50 * time.Millisecond)
+
+		winner, err := ctx.Select(slowActivity, timer)
+		if err != nil {
+			return nil, err
+		}
+		if winner != 1 {
+			return nil, fmt.Errorf("expected the timer (index 1) to win, got index %d", winner)
+		}
+		if err := timer.Await(nil); err != nil {
+			return nil, err
+		}
+		return "timer won", nil
+	})
+	r.AddActivityN("SlowActivity", func(ctx task.ActivityContext) (any, error) {
+		time.Sleep(1 * time.Second)
+		return "too slow", nil
+	})
+
+	ctx := context.Background()
+	client, worker := initTaskHubWorker(ctx, r)
+	defer worker.Shutdown(ctx)
+
+	id, err := client.ScheduleNewWorkflow(ctx, "SelectActivityRacesTimerWorkflow")
+	require.NoError(t, err)
+
+	timeoutCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	metadata, err := client.WaitForWorkflowCompletion(timeoutCtx, id)
+	require.NoError(t, err)
+	require.Equal(t, protos.OrchestrationStatus_ORCHESTRATION_STATUS_COMPLETED, metadata.RuntimeStatus)
+	assert.Equal(t, `"timer won"`, metadata.Output.Value)
+}
+
+// Test_Select_WaitForSingleEventTimeoutWins verifies that when a WaitForSingleEvent task times out
+// before its event is ever raised, Select returns that task as the winner and Await on it surfaces
+// ErrTaskCanceled, exactly as it would outside of Select.
+func Test_Select_WaitForSingleEventTimeoutWins(t *testing.T) {
+	r := task.NewTaskRegistry()
+	r.AddWorkflowN("SelectEventTimeoutWorkflow", func(ctx *task.WorkflowContext) (any, error) {
+		neverRaised := ctx.WaitForSingleEvent("NeverRaised", 50*time.Millisecond)
+		neverFires := ctx.CreateTimer(1 * time.Hour)
+
+		winner, err := ctx.Select(neverRaised, neverFires)
+		if err != nil {
+			return nil, err
+		}
+		if winner != 0 {
+			return nil, fmt.Errorf("expected the timed-out event wait (index 0) to win, got index %d", winner)
+		}
+
+		err = neverRaised.Await(nil)
+		if !errors.Is(err, task.ErrTaskCanceled) {
+			return nil, fmt.Errorf("expected ErrTaskCanceled, got %v", err)
+		}
+		return "timed out as expected", nil
+	})
+
+	ctx := context.Background()
+	client, worker := initTaskHubWorker(ctx, r)
+	defer worker.Shutdown(ctx)
+
+	id, err := client.ScheduleNewWorkflow(ctx, "SelectEventTimeoutWorkflow")
+	require.NoError(t, err)
+
+	timeoutCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	metadata, err := client.WaitForWorkflowCompletion(timeoutCtx, id)
+	require.NoError(t, err)
+	require.Equal(t, protos.OrchestrationStatus_ORCHESTRATION_STATUS_COMPLETED, metadata.RuntimeStatus)
+	assert.Equal(t, `"timed out as expected"`, metadata.Output.Value)
+}

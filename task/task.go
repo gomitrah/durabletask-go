@@ -67,31 +67,18 @@ func newTask(ctx *WorkflowContext) *completableTask {
 // of any kind. However, workflow functions must never attempt to recover from such panics to ensure that
 // the workflow execution can proceed normally.
 func (t *completableTask) Await(v any) error {
-	for {
-		if t.isCompleted {
-			if err := t.completionError(); err != nil {
-				return err
-			}
-			if v != nil && len(t.rawResult) > 0 {
-				if err := unmarshalData(t.rawResult, v); err != nil {
-					return fmt.Errorf("failed to decode task result: %w", err)
-				}
-			}
-			return nil
-		}
-
-		ok, err := t.workflowCtx.processNextEvent()
-		if err != nil {
-			return err
-		}
-		if !ok {
-			break
+	if err := t.workflowCtx.awaitUntil(func() bool { return t.isCompleted }); err != nil {
+		return err
+	}
+	if err := t.completionError(); err != nil {
+		return err
+	}
+	if v != nil && len(t.rawResult) > 0 {
+		if err := unmarshalData(t.rawResult, v); err != nil {
+			return fmt.Errorf("failed to decode task result: %w", err)
 		}
 	}
-	// TODO: Need a rule about using "defer" in workflows because planned panics will invoke them unexpectedly
-	// TODO: @joshvanl: remove panic- panic is something that should
-	// _never_ be called in normal operation.
-	panic(ErrTaskBlocked)
+	return nil
 }
 
 func (t *completableTask) TaskExecutionId() string {

@@ -105,10 +105,18 @@ func (w *WorkflowContext) WaitForExternalEvent(eventName string, timeout time.Du
 // more than one of the given tasks is already completed at the time of the call, the one with the
 // lowest index wins.
 //
-// Select requires at least one task and returns an error if no tasks are given. Every task passed to
-// Select must have been obtained from this same WorkflowContext (e.g. via CallActivity, CreateTimer,
-// or WaitForExternalEvent, with or without a retry policy); a Task implementation from outside this
-// package causes Select to return [task.ErrTaskNotSelectable].
+// Select requires at least one task and returns an error if no tasks are given, if any task is nil,
+// or if any task was not obtained from this same WorkflowContext (e.g. via CallActivity, CreateTimer,
+// or WaitForExternalEvent, with or without a retry policy) -- a task from a different WorkflowContext
+// can never complete from this context's point of view, which would otherwise block the workflow
+// indefinitely with no diagnostic. A Task implementation from outside this package is also rejected,
+// with [ErrTaskNotSelectable].
+//
+// Like Await, Select may panic with [task.ErrTaskBlocked] as the panic value when none of the tasks
+// have completed and there is no further history to process. This is normal control flow for
+// workflow functions, which must never recover from such panics: doing so prevents the workflow
+// runtime's own recovery from observing the signal, and the workflow will never emit its pending
+// actions.
 func (w *WorkflowContext) Select(tasks ...Task) (int, error) {
 	otasks := make([]task.Task, len(tasks))
 	for i, t := range tasks {

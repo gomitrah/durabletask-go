@@ -278,6 +278,26 @@ func (ctx *WorkflowContext) processNextEvent() (bool, error) {
 	return true, nil
 }
 
+// awaitUntil processes history events one at a time until [done] reports true, returning nil once
+// it does. It returns any error processNextEvent reports along the way. If history runs out before
+// [done] is satisfied, awaitUntil panics with ErrTaskBlocked, the same control-flow signal Await
+// uses: this is normal for workflow functions, which must never recover from it.
+func (ctx *WorkflowContext) awaitUntil(done func() bool) error {
+	for !done() {
+		ok, err := ctx.processNextEvent()
+		if err != nil {
+			return err
+		}
+		if !ok {
+			// TODO: Need a rule about using "defer" in workflows because planned panics will invoke them unexpectedly
+			// TODO: @joshvanl: remove panic- panic is something that should
+			// _never_ be called in normal operation.
+			panic(ErrTaskBlocked)
+		}
+	}
+	return nil
+}
+
 func (ctx *WorkflowContext) getNextHistoryEvent() (*protos.HistoryEvent, bool) {
 	var historyList []*protos.HistoryEvent
 	index := ctx.historyIndex
@@ -790,7 +810,10 @@ func (ctx *WorkflowContext) Select(tasks ...Task) (int, error) {
 		if t == nil {
 			return -1, fmt.Errorf("task at index %d is nil", i)
 		}
-		ct, ok := underlyingCompletableTask(t)
+		// Every Task this package hands out, including retry-configured ones (see
+		// internalScheduleTaskWithRetries), is backed by *completableTask; this only fails for a
+		// Task implementation from outside the package.
+		ct, ok := t.(*completableTask)
 		if !ok {
 			return -1, fmt.Errorf("task at index %d: %w", i, ErrTaskNotSelectable)
 		}
@@ -826,30 +849,10 @@ func (ctx *WorkflowContext) Select(tasks ...Task) (int, error) {
 		}
 	}()
 
-	for winner == -1 {
-		ok, err := ctx.processNextEvent()
-		if err != nil {
-			return -1, err
-		}
-		if !ok {
-			break
-		}
+	if err := ctx.awaitUntil(func() bool { return winner != -1 }); err != nil {
+		return -1, err
 	}
-
-	if winner != -1 {
-		return winner, nil
-	}
-
-	panic(ErrTaskBlocked)
-}
-
-// underlyingCompletableTask reports whether [t] is backed by this package's own *completableTask,
-// the only Task implementation whose completion Select can observe without calling Await. Every
-// Task this package hands out (including retry-configured ones, see internalScheduleTaskWithRetries)
-// is one; this only fails for a Task implementation from outside the package.
-func underlyingCompletableTask(t Task) (*completableTask, bool) {
-	ct, ok := t.(*completableTask)
-	return ct, ok
+	return winner, nil
 }
 
 func (ctx *WorkflowContext) ContinueAsNew(newInput any, options ...ContinueAsNewOption) {
