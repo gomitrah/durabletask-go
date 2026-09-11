@@ -741,6 +741,32 @@ func Test_Select_DoesNotLeakCallbacksOnLosingTasks(t *testing.T) {
 	}
 }
 
+// Test_Select_RejectsNilTask is a regression test: Select(a, nil) used to report the nil task as
+// ErrTaskNotSelectable (the same error as an unrelated, unsupported Task implementation), which
+// misidentified the actual problem.
+func Test_Select_RejectsNilTask(t *testing.T) {
+	ctx := newTestContext(t)
+	other := newTask(ctx)
+
+	_, err := ctx.Select(other, nil)
+	require.EqualError(t, err, "task at index 1 is nil")
+}
+
+// Test_Select_RejectsTaskFromDifferentContext is a regression test: a *completableTask obtained
+// from a different WorkflowContext passes the underlyingCompletableTask type assertion, so without
+// this check Select would register a callback that can never fire (the task belongs to a workflow
+// execution ctx never processes events for), blocking the workflow indefinitely with no diagnostic.
+func Test_Select_RejectsTaskFromDifferentContext(t *testing.T) {
+	ctx := newTestContext(t)
+	other := newTestContext(t)
+
+	own := newTask(ctx)
+	foreign := newTask(other)
+
+	_, err := ctx.Select(own, foreign)
+	require.EqualError(t, err, "task at index 1 belongs to a different WorkflowContext")
+}
+
 // Benchmark_ReplaySequentialActivities measures a full replay of a workflow
 // with 50 sequential completed activities, the shape dominated by the
 // per-event and per-schedule bookkeeping this file's feature adds to.

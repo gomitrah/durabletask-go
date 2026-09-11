@@ -107,9 +107,8 @@ func (w *WorkflowContext) WaitForExternalEvent(eventName string, timeout time.Du
 //
 // Select requires at least one task and returns an error if no tasks are given. Every task passed to
 // Select must have been obtained from this same WorkflowContext (e.g. via CallActivity, CreateTimer,
-// or WaitForExternalEvent); tasks whose completion cannot be observed without calling Await -- such
-// as a task returned by CallActivity/CallChildWorkflow configured with a retry policy -- are not
-// supported and cause Select to return [task.ErrTaskNotSelectable].
+// or WaitForExternalEvent, with or without a retry policy); a Task implementation from outside this
+// package causes Select to return [task.ErrTaskNotSelectable].
 func (w *WorkflowContext) Select(tasks ...Task) (int, error) {
 	otasks := make([]task.Task, len(tasks))
 	for i, t := range tasks {

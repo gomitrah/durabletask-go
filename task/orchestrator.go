@@ -407,7 +407,7 @@ func (ctx *WorkflowContext) CallActivity(activity interface{}, opts ...CallActiv
 	activityName := helpers.GetTaskFunctionName(activity)
 
 	if options.retryPolicy != nil {
-		return ctx.internalScheduleTaskWithRetries(activityName+"-retry", ctx.CurrentTimeUtc, func(taskExecutionId string, _ bool) Task {
+		return ctx.internalScheduleTaskWithRetries(activityName+"-retry", ctx.CurrentTimeUtc, func(taskExecutionId string, _ bool) *completableTask {
 			return ctx.internalScheduleActivity(activityName, taskExecutionId, options)
 		}, *options.retryPolicy, 0, uuid.NewString(), func(a *protos.CreateTimerAction, execID string) {
 			a.Origin = &protos.CreateTimerAction_ActivityRetry{
@@ -421,7 +421,7 @@ func (ctx *WorkflowContext) CallActivity(activity interface{}, opts ...CallActiv
 	return ctx.internalScheduleActivity(activityName, uuid.NewString(), options)
 }
 
-func (ctx *WorkflowContext) internalScheduleActivity(activityName, taskExecutionId string, options *callActivityOptions) Task {
+func (ctx *WorkflowContext) internalScheduleActivity(activityName, taskExecutionId string, options *callActivityOptions) *completableTask {
 	scheduleTaskAction := &protos.WorkflowAction{
 		Id: ctx.getNextSequenceNumber(),
 		WorkflowActionType: &protos.WorkflowAction_ScheduleTask{
@@ -475,7 +475,7 @@ func (ctx *WorkflowContext) CallChildWorkflow(workflow interface{}, opts ...Chil
 		if firstInstanceID == "" {
 			firstInstanceID = helpers.GenerateChildWorkflowInstanceID(string(ctx.ID), ctx.sequenceNumber)
 		}
-		return ctx.internalScheduleTaskWithRetries(workflowName+"-retry", ctx.CurrentTimeUtc, func(_ string, isRetry bool) Task {
+		return ctx.internalScheduleTaskWithRetries(workflowName+"-retry", ctx.CurrentTimeUtc, func(_ string, isRetry bool) *completableTask {
 			// On retry attempts (2nd onward) carry the first attempt's instance
 			// ID so the runtime can record it on the resulting
 			// ChildWorkflowInstanceCreatedEvent and consumers can correlate the
@@ -500,7 +500,7 @@ func (ctx *WorkflowContext) CallChildWorkflow(workflow interface{}, opts ...Chil
 // when non-nil, is the instance ID of the first attempt in this child's retry
 // chain; it is set only on retry attempts (2nd onward) and is persisted by the
 // runtime onto the ChildWorkflowInstanceCreatedEvent for retry-chain correlation.
-func (ctx *WorkflowContext) internalCallChildWorkflow(workflowName string, options *callChildWorkflowOptions, retryParentInstanceID *string) Task {
+func (ctx *WorkflowContext) internalCallChildWorkflow(workflowName string, options *callChildWorkflowOptions, retryParentInstanceID *string) *completableTask {
 	createChildWorkflow := &protos.CreateChildWorkflowAction{
 		Name:       workflowName,
 		Input:      options.rawInput,
@@ -537,40 +537,80 @@ func (ctx *WorkflowContext) internalCallChildWorkflow(workflowName string, optio
 	return task
 }
 
-func (ctx *WorkflowContext) internalScheduleTaskWithRetries(name string, initialAttempt time.Time, schedule func(taskExecutionId string, isRetry bool) Task, policy RetryPolicy, retryCount int, taskExecutionId string, setTimerOrigin func(*protos.CreateTimerAction, string)) Task {
-	return &taskWrapper{
-		delegate: schedule(taskExecutionId, retryCount > 0),
-		onAwaitResult: func(v any, taskExecutionId string, err error) error {
+// internalScheduleTaskWithRetries schedules [schedule]'s first attempt immediately and returns a
+// plain *completableTask representing the outcome of the whole retry chain: it completes
+// successfully as soon as any attempt succeeds, or with the final attempt's failure once retries
+// are exhausted. Unlike the rest of an attempt's own completion, which is driven by history events,
+// the decision to retry (creating a backoff timer, then scheduling the next attempt) is driven
+// reactively from each attempt's and timer's onCompleted callback rather than by calling Await, so
+// the returned task's completion never depends on the caller calling Await -- in particular, so it
+// can be safely passed to Select like any other task (see ErrTaskNotSelectable's history: an
+// earlier version of this function returned a wrapper task whose retry logic only ran inside
+// Await, which made it impossible for Select to safely observe without either driving retries
+// itself or silently leaving an already-scheduled attempt orphaned).
+func (ctx *WorkflowContext) internalScheduleTaskWithRetries(name string, initialAttempt time.Time, schedule func(taskExecutionId string, isRetry bool) *completableTask, policy RetryPolicy, retryCount int, taskExecutionId string, setTimerOrigin func(*protos.CreateTimerAction, string)) Task {
+	outer := newTask(ctx)
+
+	// giveUp completes outer with whichever terminal state [t] (an attempt or a backoff timer)
+	// ended in: canceled if [t] was canceled, failed with the same details otherwise.
+	giveUp := func(t *completableTask) {
+		if t.isCanceled {
+			outer.cancel()
+			return
+		}
+		outer.fail(t.failureDetails)
+	}
+
+	var attempt func(retryCount int, taskExecutionId string)
+	attempt = func(retryCount int, taskExecutionId string) {
+		delegate := schedule(taskExecutionId, retryCount > 0)
+		delegate.onCompleted(func() {
+			// Once the delegate resolves, its TaskExecutionId is the one recorded on the
+			// TaskScheduled/TaskCompleted/TaskFailed history events for this attempt, which is
+			// what must be threaded into the retry timer and the next attempt so replay stays
+			// deterministic; the taskExecutionId this attempt was scheduled with (a value that,
+			// for every attempt after the first, was itself only known once its predecessor's
+			// delegate resolved) is no longer authoritative once history says otherwise.
+			taskExecutionId := delegate.TaskExecutionId()
+
+			err := delegate.completionError()
 			if err == nil {
-				return nil
+				outer.complete(delegate.rawResult)
+				return
 			}
 
 			if retryCount+1 >= policy.MaxAttempts {
 				// next try will exceed the max attempts, dont continue
-				return err
+				giveUp(delegate)
+				return
 			}
 
 			nextDelay := computeNextDelay(ctx.CurrentTimeUtc, policy, retryCount, initialAttempt, err)
 			if nextDelay == 0 {
-				return err
+				giveUp(delegate)
+				return
 			}
-			task, action := ctx.createTimerInternal(&name, nextDelay)
+
+			timer, action := ctx.createTimerInternal(&name, nextDelay)
 			setTimerOrigin(action, taskExecutionId)
-			timerErr := task.Await(nil)
-			if timerErr != nil {
-				// TODO use errors.Join when updating golang
-				return fmt.Errorf("%v %w", timerErr, err)
-			}
-
-			t := ctx.internalScheduleTaskWithRetries(name, initialAttempt, schedule, policy, retryCount+1, taskExecutionId, setTimerOrigin)
-			err = t.Await(v)
-			if err == nil {
-				return nil
-			}
-
-			return err
-		},
+			timer.onCompleted(func() {
+				if timer.completionError() != nil {
+					// Defensive: nothing in this codebase currently cancels or fails a
+					// pending timer task -- onTimerFired is the only resolver for one, and
+					// it always calls complete(nil) -- so this is unreachable today. It
+					// guards against silently retrying forever (attempt would otherwise run
+					// again below) if that ever changes, giving up with the timer's own
+					// terminal state instead.
+					giveUp(timer)
+					return
+				}
+				attempt(retryCount+1, taskExecutionId)
+			})
+		})
 	}
+	attempt(retryCount, taskExecutionId)
+
+	return outer
 }
 
 func computeNextDelay(currentTimeUtc time.Time, policy RetryPolicy, attempt int, firstAttempt time.Time, err error) time.Duration {
@@ -730,11 +770,12 @@ func (ctx *WorkflowContext) WaitForSingleEvent(eventName string, timeout time.Du
 // more than one of the given tasks is already completed at the time of the call, the one with the
 // lowest index wins.
 //
-// Select requires at least one task and returns an error if no tasks are given. Every task passed to
-// Select must have been obtained from this same WorkflowContext (e.g. via CallActivity, CreateTimer,
-// or WaitForSingleEvent); tasks whose completion cannot be observed without calling Await -- such as
-// a task returned by CallActivity/CallChildWorkflow configured with a retry policy -- are not
-// supported and cause Select to return ErrTaskNotSelectable.
+// Select requires at least one task and returns an error if no tasks are given, if any task is nil,
+// or if any task was not obtained from this same WorkflowContext (e.g. via CallActivity, CreateTimer,
+// or WaitForSingleEvent, with or without a retry policy) -- a task from a different WorkflowContext
+// can never complete from this context's point of view, which would otherwise block the workflow
+// indefinitely with no diagnostic. A Task implementation from outside this package is also rejected,
+// with ErrTaskNotSelectable.
 //
 // Like Await, Select may panic with ErrTaskBlocked as the panic value when none of the tasks have
 // completed and there is no further history to process. This is normal control flow for workflow
@@ -746,9 +787,15 @@ func (ctx *WorkflowContext) Select(tasks ...Task) (int, error) {
 
 	completable := make([]*completableTask, len(tasks))
 	for i, t := range tasks {
+		if t == nil {
+			return -1, fmt.Errorf("task at index %d is nil", i)
+		}
 		ct, ok := underlyingCompletableTask(t)
 		if !ok {
 			return -1, fmt.Errorf("task at index %d: %w", i, ErrTaskNotSelectable)
+		}
+		if ct.workflowCtx != ctx {
+			return -1, fmt.Errorf("task at index %d belongs to a different WorkflowContext", i)
 		}
 		completable[i] = ct
 	}
@@ -796,10 +843,10 @@ func (ctx *WorkflowContext) Select(tasks ...Task) (int, error) {
 	panic(ErrTaskBlocked)
 }
 
-// underlyingCompletableTask unwraps [t] to the concrete *completableTask backing it, if any. Retry
-// wrapped tasks (taskWrapper) are deliberately not unwrapped: their real completion, including any
-// retry attempts, only happens as a side effect of calling Await on them, so their delegate's
-// completion state does not reflect whether the wrapped task, as a whole, is done.
+// underlyingCompletableTask reports whether [t] is backed by this package's own *completableTask,
+// the only Task implementation whose completion Select can observe without calling Await. Every
+// Task this package hands out (including retry-configured ones, see internalScheduleTaskWithRetries)
+// is one; this only fails for a Task implementation from outside the package.
 func underlyingCompletableTask(t Task) (*completableTask, bool) {
 	ct, ok := t.(*completableTask)
 	return ct, ok
@@ -995,9 +1042,13 @@ func (ctx *WorkflowContext) onTaskFailed(tf *protos.TaskFailedEvent) error {
 	delete(ctx.pendingTasks, taskID)
 	ctx.resolvedResolutions[key] = struct{}{}
 
+	// taskExecutionId must be set before fail() so that a completion callback registered via
+	// onCompleted (e.g. a retry chain reading TaskExecutionId to schedule its next attempt) sees
+	// it already populated: fail() runs registered callbacks synchronously as part of completing
+	// the task, before returning here.
+	task.taskExecutionId = tf.TaskExecutionId
 	// completing a task will resume the corresponding Await() call
 	task.fail(tf.FailureDetails)
-	task.taskExecutionId = tf.TaskExecutionId
 	return nil
 }
 

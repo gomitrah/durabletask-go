@@ -3,6 +3,8 @@ package tests
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -186,27 +188,38 @@ func Test_Select_NoTasks(t *testing.T) {
 	assert.Equal(t, `"Select requires at least one task"`, metadata.Output.Value)
 }
 
-// Test_Select_RetryWrappedTaskRejected verifies that a task returned by
-// CallActivity with a retry policy -- whose completion, including any
-// retries, is only ever driven by calling Await -- is rejected by Select
-// rather than silently never winning or racing incorrectly.
-func Test_Select_RetryWrappedTaskRejected(t *testing.T) {
+// Test_Select_RetryWrappedTaskWins verifies that a task returned by CallActivity with a retry
+// policy is a real, selectable task: its retries are driven independently of Select or Await, so
+// it can win a Select once its retries succeed, racing normally against a plain task.
+func Test_Select_RetryWrappedTaskWins(t *testing.T) {
 	r := task.NewTaskRegistry()
 	r.AddWorkflowN("SelectRetryWrappedWorkflow", func(ctx *task.WorkflowContext) (any, error) {
-		retried := ctx.CallActivity("FailActivity", task.WithActivityRetryPolicy(&task.RetryPolicy{
-			MaxAttempts:          2,
+		retried := ctx.CallActivity("FlakyActivity", task.WithActivityRetryPolicy(&task.RetryPolicy{
+			MaxAttempts:          3,
 			InitialRetryInterval: 10 * time.Millisecond,
 		}))
-		plain := ctx.CreateTimer(1 * time.Hour)
+		neverFires := ctx.CreateTimer(1 * time.Hour)
 
-		_, err := ctx.Select(retried, plain)
-		if err == nil {
-			return "no error", nil
+		winner, err := ctx.Select(retried, neverFires)
+		if err != nil {
+			return nil, err
 		}
-		return err.Error(), nil
+		if winner != 0 {
+			return nil, fmt.Errorf("expected the retried activity (index 0) to win, got index %d", winner)
+		}
+
+		var v string
+		if err := retried.Await(&v); err != nil {
+			return nil, err
+		}
+		return v, nil
 	})
-	r.AddActivityN("FailActivity", func(ctx task.ActivityContext) (any, error) {
-		return nil, errors.New("activity should not have been invoked")
+	var attempts int32
+	r.AddActivityN("FlakyActivity", func(ctx task.ActivityContext) (any, error) {
+		if atomic.AddInt32(&attempts, 1) < 2 {
+			return nil, errors.New("not yet")
+		}
+		return "eventually succeeded", nil
 	})
 
 	ctx := context.Background()
@@ -221,5 +234,6 @@ func Test_Select_RetryWrappedTaskRejected(t *testing.T) {
 	metadata, err := client.WaitForWorkflowCompletion(timeoutCtx, id)
 	require.NoError(t, err)
 	require.Equal(t, protos.OrchestrationStatus_ORCHESTRATION_STATUS_COMPLETED, metadata.RuntimeStatus)
-	assert.Contains(t, metadata.Output.Value, "task does not support Select")
+	assert.Equal(t, `"eventually succeeded"`, metadata.Output.Value)
+	assert.Equal(t, int32(2), atomic.LoadInt32(&attempts))
 }

@@ -18,10 +18,11 @@ var ErrTaskBlocked = errors.New("the current task is blocked")
 // when configured timeouts expire.
 var ErrTaskCanceled = errors.New("the task was canceled") // CONSIDER: More specific info about the task
 
-// ErrTaskNotSelectable is returned by [WorkflowContext.Select] when one of the given tasks doesn't
-// support the completion-callback hook Select relies on to detect a winner without calling Await
-// (for example, a task returned by a retried CallActivity/CallChildWorkflow, whose completion state
-// is only ever discovered as a side effect of calling Await).
+// ErrTaskNotSelectable is returned by [WorkflowContext.Select] when one of the given tasks isn't
+// backed by this package's own task implementation, and so doesn't support the completion-callback
+// hook Select relies on to detect a winner without calling Await. Every Task returned by a
+// WorkflowContext method is selectable; this only happens for a Task implementation from outside
+// this package.
 var ErrTaskNotSelectable = errors.New("task does not support Select")
 
 // Task is an interface for asynchronous durable tasks. A task is conceptually similar to a future.
@@ -68,10 +69,8 @@ func newTask(ctx *WorkflowContext) *completableTask {
 func (t *completableTask) Await(v any) error {
 	for {
 		if t.isCompleted {
-			if t.failureDetails != nil {
-				return fmt.Errorf("task failed with an error: %v", t.failureDetails.ErrorMessage)
-			} else if t.isCanceled {
-				return ErrTaskCanceled
+			if err := t.completionError(); err != nil {
+				return err
 			}
 			if v != nil && len(t.rawResult) > 0 {
 				if err := unmarshalData(t.rawResult, v); err != nil {
@@ -97,6 +96,19 @@ func (t *completableTask) Await(v any) error {
 
 func (t *completableTask) TaskExecutionId() string {
 	return t.taskExecutionId
+}
+
+// completionError returns the error a completed task represents -- nil on success, the formatted
+// failure on a failed task, or ErrTaskCanceled on a canceled one -- without touching the task's raw
+// result. It must only be called once t.isCompleted is true.
+func (t *completableTask) completionError() error {
+	if t.failureDetails != nil {
+		return fmt.Errorf("task failed with an error: %v", t.failureDetails.ErrorMessage)
+	}
+	if t.isCanceled {
+		return ErrTaskCanceled
+	}
+	return nil
 }
 
 // onCompleted registers [callback] to run when the task completes, and returns a function that
@@ -161,20 +173,4 @@ func (t *completableTask) completeInternal() {
 	for _, id := range ids {
 		callbacks[id]()
 	}
-}
-
-type taskWrapper struct {
-	delegate      Task
-	onAwaitResult func(any, string, error) error
-}
-
-var _ Task = &taskWrapper{}
-
-func (t *taskWrapper) Await(v any) error {
-	err := t.delegate.Await(v)
-	return t.onAwaitResult(v, t.delegate.TaskExecutionId(), err)
-}
-
-func (t *taskWrapper) TaskExecutionId() string {
-	return t.delegate.TaskExecutionId()
 }
